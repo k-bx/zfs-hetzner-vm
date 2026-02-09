@@ -99,16 +99,27 @@ resolvectl status || true
 cat /etc/systemd/network/10-hetzner.network
 ```
 
+If your rescue system uses a routed-subnet style route (common on Hetzner dedicated), you should see IPv4 configured as `/32` plus explicit routes.
+
+## How Long To Wait After Reboot
+
+- If the install succeeded, you typically get ping/SSH within **2-5 minutes** after power cycling (UEFI firmware + ZFSBootMenu + Debian boot).
+- If you still have no ping/SSH after **5 minutes**, assume it did not boot the OS (boot order / boot menu) and go back to rescue to check UEFI boot entries.
+
 ## Notes / Troubleshooting
 
 - If the box boots but has no network:
   - Double-check the `MACAddress=` in `/etc/systemd/network/10-hetzner.network` matches your NIC.
   - Ensure the IPv4 address/prefix and gateway match what Hetzner provides for the server.
+  - Compare `ip -4 route` in rescue vs the installed OS. If rescue shows your subnet routed via the gateway, your OS must replicate it (script does this automatically when detected).
 - If you selected two disks but the pool is not mirrored:
   - Re-run `zpool status`. You should see `mirror-0`. If you see two devices without `mirror`, you created a stripe and should reinstall (or rebuild the pool).
 - If you need to mount the root dataset from rescue after installation:
   - ZFS datasets with `mountpoint=/` cannot be mounted via `mount -t zfs ...`.
   - Use `zfs set mountpoint=/mnt/debian rpool/ROOT/debian; zfs mount rpool/ROOT/debian` temporarily, then restore it to `/` afterwards.
+- If the system does not boot from disk (common on some dedicated firmware):
+  - In rescue, install `efibootmgr` and create explicit UEFI boot entries pointing at `\\EFI\\Boot\\bootx64.efi` on each ESP.
+  - Verify with `efibootmgr -v` that the `BootOrder` begins with the `ZFSBootMenu` entries and optionally set `BootNext` for the next reboot.
 
 ## Example (pve-hz-3, 2026-02-09)
 

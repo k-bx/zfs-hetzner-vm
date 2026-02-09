@@ -48,6 +48,9 @@ NETWORK_MODE="static" # "static" (recommended for dedicated) or "dhcp"
 NET_IFACE=""
 NET_MAC=""
 NET_IPV4_CIDR=""
+NET_IPV4_ADDR=""
+NET_IPV4_ROUTED_SUBNET=""
+NET_IPV4_GATEWAY_LINK_ROUTE=false
 NET_GW4=""
 NET_IPV6_CIDR=""
 NET_GW6=""
@@ -285,6 +288,7 @@ function detect_network_from_rescue {
 
     if [[ -n "$NET_IFACE" ]]; then
         NET_IPV4_CIDR="$(ip -4 -o addr show dev "$NET_IFACE" scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+        NET_IPV4_ADDR="${NET_IPV4_CIDR%/*}"
         NET_MAC="$(cat "/sys/class/net/$NET_IFACE/address" 2>/dev/null || true)"
     fi
 
@@ -332,6 +336,26 @@ function detect_network_from_rescue {
                 | head -n 3 \
                 || true
         )
+    fi
+
+    # Some Hetzner dedicated setups use routed-subnet style routes (even when the address is configured as /26),
+    # e.g.:
+    #   default via GW dev IFACE
+    #   SUBNET via GW dev IFACE
+    #   GW dev IFACE scope link
+    # Replicating this in systemd-networkd tends to be more reliable than assuming a connected subnet route.
+    NET_IPV4_ROUTED_SUBNET=""
+    NET_IPV4_GATEWAY_LINK_ROUTE=false
+    if [[ -n "$NET_IFACE" && -n "$NET_GW4" ]]; then
+        NET_IPV4_ROUTED_SUBNET="$(ip -4 route show 2>/dev/null \
+            | awk -v gw="$NET_GW4" -v dev="$NET_IFACE" '
+                $1 != "default" && $0 ~ (" via " gw " dev " dev) {print $1; exit}
+            ' \
+            || true)"
+
+        if ip -4 route show 2>/dev/null | grep -qE "^${NET_GW4}[[:space:]]+dev[[:space:]]+${NET_IFACE}([[:space:]]+|$)"; then
+            NET_IPV4_GATEWAY_LINK_ROUTE=true
+        fi
     fi
 }
 
@@ -514,11 +538,11 @@ function partition_disk {
 # ---- ZFS Pool and Dataset Functions ----
 function create_zfs_pool {
     echo "======= Creating ZFS pool =========="
-    # Clean up any existing ZFS binaries in PATH
-    rm -f "$(which zfs)" 2>/dev/null || true
-    rm -f "$(which zpool)" 2>/dev/null || true
-    
-    export PATH=/usr/sbin:$PATH
+
+    # Prefer system binaries over any rescue-provided wrapper scripts (Hetzner sometimes ships
+    # /usr/local/sbin/zpool -> install_openzfs.sh which prompts interactively).
+    export PATH="/usr/sbin:/sbin:/bin:/usr/bin:/usr/local/sbin"
+
     modprobe zfs
 
     local vdev_args=()
@@ -848,6 +872,12 @@ function setup_efi_boot {
     echo "Downloading ZFSBootMenu EFI binary from: $ZBM_EFI_URL"
     curl -L "$ZBM_EFI_URL" -o "$tmp_efi"
 
+    if ! command -v efibootmgr &>/dev/null; then
+        echo "Installing efibootmgr in rescue system..."
+        apt update
+        apt install -y efibootmgr
+    fi
+
     for boot_part in "${BOOT_PARTS[@]}"; do
         mkdir -p "$MAIN_BOOT"
         mount "$boot_part" "$MAIN_BOOT"
@@ -856,6 +886,15 @@ function setup_efi_boot {
         sync
         umount "$MAIN_BOOT" || true
     done
+
+    # Create explicit UEFI boot entries (some firmware does not reliably fall back to \EFI\Boot\bootx64.efi).
+    # We create one entry per disk so either disk can boot.
+    for idx in "${!INSTALL_DISKS[@]}"; do
+        local disk="${INSTALL_DISKS[$idx]}"
+        echo "Creating UEFI boot entry for $disk..."
+        efibootmgr -c -d "$disk" -p 1 -L "ZFSBootMenu (${ZFS_POOL}) ${idx}" -l '\\EFI\\Boot\\bootx64.efi' || true
+    done
+    efibootmgr -v || true
 
     rm -f "$tmp_efi"
 }
@@ -981,16 +1020,37 @@ function configure_networking {
             dns_line="DNS=$(printf '%s ' "${NET_DNS_SERVERS[@]}" | sed 's/[[:space:]]*$//')"
         fi
 
+        local ipv4_addr_line="Address=$NET_IPV4_CIDR"
+        if [[ -n "$NET_IPV4_ROUTED_SUBNET" && -n "$NET_IPV4_ADDR" ]]; then
+            # Prefer /32 when the rescue system indicates routed-subnet behavior.
+            ipv4_addr_line="Address=${NET_IPV4_ADDR}/32"
+        fi
+
         {
             echo "[Match]"
             echo "MACAddress=$NET_MAC"
             echo ""
             echo "[Network]"
-            echo "Address=$NET_IPV4_CIDR"
+            echo "$ipv4_addr_line"
             echo "$dns_line"
             echo "IPv6AcceptRA=yes"
             if [[ -n "$NET_IPV6_CIDR" ]]; then
                 echo "Address=$NET_IPV6_CIDR"
+            fi
+
+            if [[ "$NET_IPV4_GATEWAY_LINK_ROUTE" == "true" ]]; then
+                echo ""
+                echo "[Route]"
+                echo "Destination=${NET_GW4}/32"
+                echo "Scope=link"
+            fi
+
+            if [[ -n "$NET_IPV4_ROUTED_SUBNET" ]]; then
+                echo ""
+                echo "[Route]"
+                echo "Destination=${NET_IPV4_ROUTED_SUBNET}"
+                echo "Gateway=$NET_GW4"
+                echo "GatewayOnLink=yes"
             fi
             echo ""
             echo "[Route]"

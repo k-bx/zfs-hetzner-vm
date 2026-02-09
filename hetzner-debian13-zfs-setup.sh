@@ -297,7 +297,42 @@ function detect_network_from_rescue {
         fi
     fi
 
-    mapfile -t NET_DNS_SERVERS < <(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n3 || true)
+    NET_DNS_SERVERS=()
+
+    # Prefer resolvectl (rescue often uses stub /etc/resolv.conf -> 127.0.0.53).
+    if command -v resolvectl &>/dev/null; then
+        mapfile -t NET_DNS_SERVERS < <(
+            resolvectl dns 2>/dev/null \
+                | awk '{for (i=2;i<=NF;i++) print $i}' \
+                | grep -vE '^(127\.0\.0\.53|::1)$' \
+                | head -n 4 \
+                || true
+        )
+
+        if [[ ${#NET_DNS_SERVERS[@]} -eq 0 ]]; then
+            # Fallback: parse the "DNS Servers" block from `resolvectl status`.
+            mapfile -t NET_DNS_SERVERS < <(
+                resolvectl status 2>/dev/null \
+                    | awk '
+                        $1=="DNS" && $2=="Servers" {in=1; for (i=3;i<=NF;i++) print $i; next}
+                        in && $1 ~ /^[0-9a-fA-F:.]+$/ {for (i=1;i<=NF;i++) print $i; next}
+                        in && NF==0 {exit}
+                    ' \
+                    | head -n 4 \
+                    || true
+            )
+        fi
+    fi
+
+    # Last resort: /etc/resolv.conf (ignore systemd-resolved stub)
+    if [[ ${#NET_DNS_SERVERS[@]} -eq 0 ]]; then
+        mapfile -t NET_DNS_SERVERS < <(
+            awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null \
+                | grep -vE '^(127\.0\.0\.53|::1)$' \
+                | head -n 3 \
+                || true
+        )
+    fi
 }
 
 function select_install_disks {
@@ -421,6 +456,15 @@ function install_zfs_on_rescue_system {
     apt -t bookworm-backports install -y zfsutils-linux
 }
 
+function stop_mdraid_and_lvm {
+    # Some rescue environments auto-assemble mdraid/LVM from previous installs, which can make disks "busy".
+    echo "======= Stopping mdraid/LVM (if present) =========="
+    swapoff -a 2>/dev/null || true
+    vgchange -an 2>/dev/null || true
+    mdadm --stop --scan 2>/dev/null || true
+    mdadm --remove --scan 2>/dev/null || true
+}
+
 # ---- Disk Partitioning Functions ----
 function partition_disk {
     echo "======= Partitioning disk =========="
@@ -491,7 +535,11 @@ function create_zfs_pool {
         -O mountpoint=none \
         "$ZFS_POOL" "${vdev_args[@]}"
 
-    zfs create -o mountpoint=none   "$ZFS_POOL/ROOT"
+    zfs create -o mountpoint=none "$ZFS_POOL/ROOT"
+
+    # During install we mount the dataset explicitly to $TARGET using `mount -t zfs`,
+    # which requires mountpoint=legacy. We'll switch it to mountpoint=/ and
+    # canmount=noauto during finalization.
     zfs create -o mountpoint=legacy "$ZFS_POOL/ROOT/debian"
 
     echo "======= Assigning $ZFS_POOL/ROOT/debian dataset as bootable =========="
@@ -534,6 +582,11 @@ function create_additional_zfs_datasets {
 
 function set_final_mountpoints {
     echo "======= Setting final mountpoints =========="
+
+    # ZFSBootMenu expects the boot environment dataset to be mountpoint=/ and
+    # canmount=noauto so it does not auto-mount during imports.
+    zfs set mountpoint=/ "$ZFS_POOL/ROOT/debian"
+    zfs set canmount=noauto "$ZFS_POOL/ROOT/debian"
     
     # Leaf datasets - actual system mountpoints
     zfs set mountpoint=/tmp "$ZFS_POOL/ROOT/debian/tmp"
@@ -559,8 +612,8 @@ function bootstrap_debian_system {
         apt install -y debootstrap
     fi
 
-    #echo "======= Copying staged system to ZFS datasets =========="
-    # Mount root dataset for copying
+    # Mount the root dataset at $TARGET for the installation phase.
+    # This does not change the dataset's mountpoint property.
     mkdir -p "$TARGET"
     mount -t zfs "$ZFS_POOL/ROOT/debian" "$TARGET"
 
@@ -874,7 +927,8 @@ function configure_bootloader {
     fi
 
     echo "======= Configuring ZFSBootMenu for auto-detection =========="
-    zfs set org.zfsbootmenu:commandline="ro quiet" "$ZFS_POOL/ROOT/debian"
+    # Ensure ZBM auto-boots without requiring KVM interaction.
+    zfs set org.zfsbootmenu:commandline="ro quiet zbm.timeout=5" "$ZFS_POOL/ROOT/debian"
 
     echo "Boot configuration:"
     zfs get org.zfsbootmenu:commandline "$ZFS_POOL/ROOT/debian"
@@ -892,11 +946,17 @@ function configure_system_services {
 
     echo "======= Enabling essential system services =========="
     chroot "$TARGET" /bin/bash <<'EOF'
-set -euo pipefail
+	set -euo pipefail
 
-systemctl enable systemd-resolved
-systemctl enable systemd-timesyncd
-systemctl enable systemd-networkd
+	# Avoid conflicts: Debian base often enables ifupdown's networking.service.
+	systemctl disable networking.service || true
+	systemctl mask networking.service || true
+	systemctl disable ifupdown-wait-online.service || true
+	systemctl mask ifupdown-wait-online.service || true
+	
+	systemctl enable systemd-resolved
+	systemctl enable systemd-timesyncd
+	systemctl enable systemd-networkd
 
 systemctl enable zfs-import-cache
 systemctl enable zfs-mount
@@ -1105,6 +1165,7 @@ function main {
     # Rescue system preparation
     remove_unused_kernels
     install_zfs_on_rescue_system
+    stop_mdraid_and_lvm
     
     # Disk partitioning
     partition_disk

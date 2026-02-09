@@ -16,7 +16,10 @@ screen -S zfs
 4. Stop any automatic Linux software RAID (common on some Hetzner images):
 
 ```bash
+vgchange -an || true
 mdadm --stop --scan || true
+mdadm --remove --scan || true
+cat /proc/mdstat
 ```
 
 5. Ensure the two target disks are not mounted/in-use and are the ones you intend to wipe:
@@ -25,6 +28,10 @@ mdadm --stop --scan || true
 lsblk -o NAME,SIZE,MODEL,TYPE,MOUNTPOINT,RO
 blkid || true
 ```
+
+If you still see `/dev/md*` devices or LVM volumes (`vg0-*`) in `lsblk`, it means something is still active:
+- Deactivate LVM again: `vgchange -an`
+- Then stop the specific arrays: `mdadm --stop /dev/md0 /dev/md1 /dev/md2` (adjust to what `cat /proc/mdstat` shows)
 
 If `blkid` shows `linux_raid_member` or other leftover signatures on the target disks, wipe signatures (pick one approach):
 
@@ -52,6 +59,7 @@ During the prompts:
 1. When asked about ZFS mirror mode, choose **Yes**.
 1. For networking:
    - On dedicated servers, choose **STATIC** networking when the script offers to use the detected config from rescue.
+   - The script detects DNS via `resolvectl` (not `/etc/resolv.conf`), so it works even when rescue uses `127.0.0.53`.
 
 The script will reboot at the end.
 
@@ -65,6 +73,16 @@ zpool get ashift,bootfs,cachefile
 ```
 
 You should see a `mirror-0` vdev with both member partitions.
+
+2. Verify the root dataset properties (important for ZFSBootMenu boot):
+
+```bash
+zfs get mountpoint,canmount rpool/ROOT/debian
+```
+
+Expected:
+- `mountpoint=/`
+- `canmount=noauto`
 
 2. Verify networking:
 
@@ -88,4 +106,19 @@ cat /etc/systemd/network/10-hetzner.network
   - Ensure the IPv4 address/prefix and gateway match what Hetzner provides for the server.
 - If you selected two disks but the pool is not mirrored:
   - Re-run `zpool status`. You should see `mirror-0`. If you see two devices without `mirror`, you created a stripe and should reinstall (or rebuild the pool).
+- If you need to mount the root dataset from rescue after installation:
+  - ZFS datasets with `mountpoint=/` cannot be mounted via `mount -t zfs ...`.
+  - Use `zfs set mountpoint=/mnt/debian rpool/ROOT/debian; zfs mount rpool/ROOT/debian` temporarily, then restore it to `/` afterwards.
 
+## Example (pve-hz-3, 2026-02-09)
+
+Detected in rescue mode:
+- Boot mode: UEFI (`/sys/firmware/efi` present)
+- Disks: `/dev/nvme0n1` and `/dev/nvme1n1` (1.92TB each)
+- Active mdraid to stop before install: `md0`, `md1`, `md2` (RAID-1)
+- Network:
+  - Primary link in rescue: `eth0`
+  - MAC: `10:7c:61:56:f1:5c`
+  - IPv4: `142.132.150.135/26`, gateway `142.132.150.129`
+  - IPv6: `2a01:4f8:261:2684::2/64`, gateway `fe80::1`
+  - DNS: `185.12.64.1`, `185.12.64.2`, `2a01:4ff:ff00::add:1`, `2a01:4ff:ff00::add:2`

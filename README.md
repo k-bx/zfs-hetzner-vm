@@ -36,6 +36,8 @@ Debian 13 minimal setup with SSH server
 wget -qO- https://raw.githubusercontent.com/terem42/zfs-hetzner-vm/master/hetzner-debian13-zfs-setup.sh | bash -
 ````
 
+For Hetzner dedicated servers with 2 disks (ZFS mirror / RAID-1), see `DEDICATED_DEBIAN13_ZFS_RAID1.md`.
+
 Ubuntu 18.04 LTS minimal setup with SSH server
 
 ````bash

@@ -32,14 +32,37 @@ MIRROR_SITE="https://mirror.hetzner.com"
 MIRROR_MAIN="deb ${MIRROR_SITE}/debian/packages ${DEBIAN_CODENAME} main contrib non-free non-free-firmware"
 MIRROR_UPDATES="deb ${MIRROR_SITE}/debian/packages ${DEBIAN_CODENAME}-updates main contrib non-free non-free-firmware"
 MIRROR_SECURITY="deb ${MIRROR_SITE}/debian/security ${DEBIAN_CODENAME}-security main contrib non-free non-free-firmware"
+MIRROR_BACKPORTS="deb ${MIRROR_SITE}/debian/packages ${DEBIAN_CODENAME}-backports main contrib non-free non-free-firmware"
 
 # Global variables
-INSTALL_DISK=""
+INSTALL_DISKS=()
+USE_MIRROR=true
+
 EFI_MODE=false
-BOOT_LABEL=""
-BOOT_TYPE=""
-BOOT_PART=""
-ZFS_PART=""
+
+BOOT_PARTS=()
+ZFS_PARTS=()
+
+# Network (auto-detected from rescue for dedicated servers)
+NETWORK_MODE="static" # "static" (recommended for dedicated) or "dhcp"
+NET_IFACE=""
+NET_MAC=""
+NET_IPV4_CIDR=""
+NET_GW4=""
+NET_IPV6_CIDR=""
+NET_GW6=""
+NET_DNS_SERVERS=()
+
+# ---- Helpers ----
+function part_path {
+    local disk="$1"
+    local part_num="$2"
+    if [[ "$disk" =~ [0-9]$ ]]; then
+        echo "${disk}p${part_num}"
+    else
+        echo "${disk}${part_num}"
+    fi
+}
 
 # ---- User Input Functions ----
 function setup_whiptail_colors {
@@ -175,16 +198,36 @@ function get_root_password {
 }
 
 function show_summary_and_confirm {
-    local summary="Please review the installation settings:
+    local disks_display
+    disks_display="$(printf '%s ' "${INSTALL_DISKS[@]}" | sed 's/[[:space:]]*$//')"
+
+    local net_display="Mode: ${NETWORK_MODE}"
+    if [[ "$NETWORK_MODE" == "static" && -n "${NET_MAC}" ]]; then
+        local dns_display
+        dns_display="$(printf '%s ' "${NET_DNS_SERVERS[@]}" | sed 's/[[:space:]]*$//')"
+        net_display="Mode: static
+MAC: ${NET_MAC}
+IPv4: ${NET_IPV4_CIDR}
+GW4: ${NET_GW4}
+IPv6: ${NET_IPV6_CIDR}
+GW6: ${NET_GW6}
+DNS: ${dns_display}"
+    fi
+
+    local summary
+    summary="Please review the installation settings:
 
 Hostname: $SYSTEM_HOSTNAME
 ZFS Pool: $ZFS_POOL
 Debian Version: $DEBIAN_CODENAME (13)
 Target: $TARGET
 Boot Mode: $([ "$EFI_MODE" = true ] && echo "EFI" || echo "BIOS")
-Install Disk: $INSTALL_DISK
+Install Disk(s): ${disks_display}
+ZFS Layout: $([ "$USE_MIRROR" = true ] && echo "mirror (RAID-1)" || echo "single/stripe")
+Networking:
+${net_display}
 
-*** WARNING: This will DESTROY ALL DATA on $INSTALL_DISK! ***
+*** WARNING: This will DESTROY ALL DATA on the selected disk(s)! ***
 
 Do you want to continue with the installation?"
     
@@ -223,18 +266,42 @@ function detect_efi {
     if [ -d /sys/firmware/efi ]; then
         echo "✓ EFI firmware detected"
         EFI_MODE=true
-        BOOT_LABEL="EFI"
-        BOOT_TYPE="ef00"
     else
         echo "✓ Legacy BIOS mode detected"
         EFI_MODE=false
-        BOOT_LABEL="boot"
-        BOOT_TYPE="8300"
     fi
 }
 
-function find_install_disk {
-    echo "======= Finding install disk =========="
+function detect_network_from_rescue {
+    # Best-effort auto-detection: use the current rescue system's default route and IP config.
+    local def4 def6
+    def4="$(ip -4 route show default 2>/dev/null | head -n1 || true)"
+    def6="$(ip -6 route show default 2>/dev/null | head -n1 || true)"
+
+    if [[ -n "$def4" ]]; then
+        NET_GW4="$(awk '{for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}' <<<"$def4" || true)"
+        NET_IFACE="$(awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' <<<"$def4" || true)"
+    fi
+
+    if [[ -n "$NET_IFACE" ]]; then
+        NET_IPV4_CIDR="$(ip -4 -o addr show dev "$NET_IFACE" scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+        NET_MAC="$(cat "/sys/class/net/$NET_IFACE/address" 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$def6" ]]; then
+        NET_GW6="$(awk '{for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}' <<<"$def6" || true)"
+        local iface6
+        iface6="$(awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' <<<"$def6" || true)"
+        if [[ -n "$iface6" ]]; then
+            NET_IPV6_CIDR="$(ip -6 -o addr show dev "$iface6" scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+        fi
+    fi
+
+    mapfile -t NET_DNS_SERVERS < <(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n3 || true)
+}
+
+function select_install_disks {
+    echo "======= Selecting installation disks =========="
     
     local candidate_disks=()
     
@@ -250,13 +317,81 @@ function find_install_disk {
         echo "Looking for: unmounted, writable disks without partitions in use" >&2
         exit 1
     fi
-    
-    INSTALL_DISK="${candidate_disks[0]}"
-    echo "Using installation disk: $INSTALL_DISK"
-    
-    # Show all available disks for verification
+
+    # Build whiptail checklist entries: TAG ITEM STATUS
+    local menu_entries=()
+    for disk in "${candidate_disks[@]}"; do
+        local size model
+        size="$(lsblk -dnpo SIZE "$disk" 2>/dev/null | head -n1 || true)"
+        model="$(lsblk -dnpo MODEL "$disk" 2>/dev/null | sed 's/[[:space:]]\+/ /g' | head -n1 || true)"
+        menu_entries+=("$disk" "${size} ${model}" "OFF")
+    done
+
+    # Show all available disks for operator sanity
     echo "All available disks:"
-    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,RO | grep -v loop
+    lsblk -o NAME,SIZE,MODEL,TYPE,MOUNTPOINT,RO | grep -v loop || true
+
+    while true; do
+        mapfile -t INSTALL_DISKS < <(whiptail \
+            --title " Installation Disks " \
+            --separate-output \
+            --checklist "\nSelect ONE or TWO disks for installation.\n\nFor RAID-1 (mirror), select both identical drives.\n\nWARNING: all selected disks will be wiped." \
+            20 78 10 \
+            "${menu_entries[@]}" \
+            3>&1 1>&2 2>&3)
+
+        local exit_status=$?
+        if [ $exit_status -ne 0 ]; then
+            echo "Installation cancelled by user."
+            exit 1
+        fi
+
+        if [[ ${#INSTALL_DISKS[@]} -eq 0 ]]; then
+            continue
+        fi
+
+        if [[ ${#INSTALL_DISKS[@]} -gt 2 ]]; then
+            whiptail \
+                --title " Too Many Disks " \
+                --msgbox "\nPlease select at most TWO disks.\n\nSelected:\n$(printf '%s\n' "${INSTALL_DISKS[@]}")" \
+                16 70
+            continue
+        fi
+
+        if [[ ${#INSTALL_DISKS[@]} -ge 1 ]]; then
+            break
+        fi
+    done
+
+    USE_MIRROR=false
+    if [[ ${#INSTALL_DISKS[@]} -gt 1 ]]; then
+        if whiptail \
+            --title " ZFS Mirror " \
+            --yesno "\nYou selected multiple disks:\n\n$(printf '%s\n' "${INSTALL_DISKS[@]}")\n\nCreate a ZFS mirror (RAID-1) across them?\n\nRecommended for 2 identical drives." \
+            18 70; then
+            USE_MIRROR=true
+        else
+            USE_MIRROR=false
+        fi
+    fi
+
+    # Dedicated servers typically require static config; auto-detect from rescue.
+    detect_network_from_rescue
+    if [[ -n "${NET_IPV4_CIDR}" && -n "${NET_GW4}" && -n "${NET_MAC}" ]]; then
+        local dns_display
+        dns_display="$(printf '%s ' "${NET_DNS_SERVERS[@]}" | sed 's/[[:space:]]*$//')"
+        if whiptail \
+            --title " Networking " \
+            --yesno "\nDetected network configuration from rescue:\n\nInterface: ${NET_IFACE}\nMAC: ${NET_MAC}\nIPv4: ${NET_IPV4_CIDR}\nGateway: ${NET_GW4}\nDNS: ${dns_display}\n\nUse STATIC networking (recommended for dedicated servers)?" \
+            18 72; then
+            NETWORK_MODE="static"
+        else
+            NETWORK_MODE="dhcp"
+        fi
+    else
+        # If we cannot detect, fall back to DHCP.
+        NETWORK_MODE="dhcp"
+    fi
 }
 
 # ---- Rescue System Preparation Functions ----
@@ -289,38 +424,47 @@ function install_zfs_on_rescue_system {
 # ---- Disk Partitioning Functions ----
 function partition_disk {
     echo "======= Partitioning disk =========="
-    sgdisk -Z "$INSTALL_DISK"  
-    
-    if [ "$EFI_MODE" = true ]; then
-        echo "Creating EFI partition layout"
-        # EFI System Partition (ESP) - 64MB is plenty for ZFSBootMenu
-        sgdisk -n1:1M:+128M -t1:ef00 -c1:"EFI" "$INSTALL_DISK"
-        # ZFS partition
-        sgdisk -n2:0:0   -t2:bf00 -c2:"zfs"  "$INSTALL_DISK"
-    else
-        echo "Creating BIOS partition layout"
-        # /boot partition - 64MB is also sufficient for BIOS ZFSBootMenu
-        sgdisk -n1:1M:+128M -t1:8300 -c1:"boot" "$INSTALL_DISK"
-        # ZFS partition
-        sgdisk -n2:0:0   -t2:bf00 -c2:"zfs"  "$INSTALL_DISK"
-        # Set legacy BIOS bootable flag
-        sgdisk -A 1:set:2 "$INSTALL_DISK"
-    fi
-    
-    partprobe "$INSTALL_DISK" || true
+    BOOT_PARTS=()
+    ZFS_PARTS=()
+
+    for disk in "${INSTALL_DISKS[@]}"; do
+        echo "Wiping partition table on: $disk"
+        sgdisk -Z "$disk"
+
+        if [ "$EFI_MODE" = true ]; then
+            echo "Creating EFI partition layout on: $disk"
+            sgdisk -n1:1M:+128M -t1:ef00 -c1:"EFI" "$disk"
+            sgdisk -n2:0:0     -t2:bf00 -c2:"zfs" "$disk"
+        else
+            echo "Creating BIOS partition layout on: $disk"
+            sgdisk -n1:1M:+128M -t1:8300 -c1:"boot" "$disk"
+            sgdisk -n2:0:0     -t2:bf00 -c2:"zfs" "$disk"
+            sgdisk -A 1:set:2 "$disk"
+        fi
+
+        BOOT_PARTS+=("$(part_path "$disk" 1)")
+        ZFS_PARTS+=("$(part_path "$disk" 2)")
+    done
+
+    # Re-read partition tables
+    for disk in "${INSTALL_DISKS[@]}"; do
+        partprobe "$disk" || true
+    done
     udevadm settle
-    
-    # Set partition variables based on mode
+
+    # Format boot partitions
     if [ "$EFI_MODE" = true ]; then
-        BOOT_PART="$(blkid -t PARTLABEL='EFI' -o device)"
-        ZFS_PART="$(blkid -t PARTLABEL='zfs' -o device)"
-        # Format ESP as FAT32
-        mkfs.fat -F 32 -n EFI "$BOOT_PART"
+        for boot_part in "${BOOT_PARTS[@]}"; do
+            mkfs.fat -F 32 -n EFI "$boot_part"
+        done
     else
-        BOOT_PART="$(blkid -t PARTLABEL='boot' -o device)"
-        ZFS_PART="$(blkid -t PARTLABEL='zfs' -o device)"
-        mkfs.ext4 -F -L boot "$BOOT_PART"
+        for boot_part in "${BOOT_PARTS[@]}"; do
+            mkfs.ext4 -F -L boot "$boot_part"
+        done
     fi
+
+    # Convenience: first disk is treated as "primary" for any single-disk assumptions.
+    :
 }
 
 # ---- ZFS Pool and Dataset Functions ----
@@ -332,14 +476,20 @@ function create_zfs_pool {
     
     export PATH=/usr/sbin:$PATH
     modprobe zfs
-    
+
+    local vdev_args=()
+    if [[ "$USE_MIRROR" == "true" && ${#ZFS_PARTS[@]} -gt 1 ]]; then
+        vdev_args+=(mirror)
+    fi
+    vdev_args+=("${ZFS_PARTS[@]}")
+
     zpool create -f -o ashift=12 \
-    -o cachefile="/etc/zfs/zpool.cache" \
-    -O compression=lz4 \
-    -O acltype=posixacl \
-    -O xattr=sa \
-    -O mountpoint=none \
-    "$ZFS_POOL" "$ZFS_PART"
+        -o cachefile="/etc/zfs/zpool.cache" \
+        -O compression=lz4 \
+        -O acltype=posixacl \
+        -O xattr=sa \
+        -O mountpoint=none \
+        "$ZFS_POOL" "${vdev_args[@]}"
 
     zfs create -o mountpoint=none   "$ZFS_POOL/ROOT"
     zfs create -o mountpoint=legacy "$ZFS_POOL/ROOT/debian"
@@ -510,19 +660,19 @@ EOF
 
 function install_system_packages {
     echo "======= Installing ZFS and essential packages in chroot =========="
+    # Configure apt sources for Debian 13 in the target system (outside chroot so we can use script variables).
+    cat > "$TARGET/etc/apt/sources.list" <<EOF
+$MIRROR_MAIN
+$MIRROR_UPDATES
+$MIRROR_SECURITY
+$MIRROR_BACKPORTS
+EOF
+
     chroot "$TARGET" /bin/bash <<'EOF'
-set -euo pipefail
-
-# Configure sources.list for Debian 13
-cat > /etc/apt/sources.list <<'SOURCES'
-deb https://mirror.hetzner.com/debian/packages trixie main contrib non-free non-free-firmware
-deb https://mirror.hetzner.com/debian/packages trixie-updates main contrib non-free non-free-firmware
-deb https://mirror.hetzner.com/debian/security trixie-security main contrib non-free non-free-firmware
-deb https://mirror.hetzner.com/debian/packages trixie-backports main contrib non-free non-free-firmware
-SOURCES
-
-# Update package lists
-apt update
+	set -euo pipefail
+	
+	# Update package lists
+	apt update
 
 # Install kernel
 apt install -y --no-install-recommends linux-image-cloud-amd64 linux-headers-cloud-amd64
@@ -532,9 +682,13 @@ apt install -y curl nano htop net-tools ssh \
     apt-transport-https ca-certificates gnupg dirmngr \
     firmware-linux-free apparmor
 
-echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections
+	echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections
 
-apt install -y -t trixie-backports zfsutils-linux zfs-initramfs zfs-dkms
+	# Prefer backports (newer ZFS), but fall back to the regular release if backports is unavailable.
+	if ! apt install -y -t trixie-backports zfsutils-linux zfs-initramfs zfs-dkms; then
+	    echo "Backports ZFS install failed; retrying without -t trixie-backports..."
+	    apt install -y zfsutils-linux zfs-initramfs zfs-dkms
+	fi
 
 # Get the actual kernel version installed in the chroot
 KERNEL_VERSION=$(ls /lib/modules/ | head -n1)
@@ -620,7 +774,8 @@ EOF
 
 function set_root_credentials {
     echo "======= Setting root password =========="
-    chroot "$TARGET" /bin/bash -c "echo root:$(printf "%q" "$ROOT_PASSWORD") | chpasswd"
+    # Feed chpasswd via stdin to avoid shell escaping issues.
+    printf '%s\n' "root:${ROOT_PASSWORD}" | chroot "$TARGET" chpasswd
 
     echo "============ Setting up root prompt ============"
     cat > "$TARGET/root/.bashrc" <<CONF
@@ -634,38 +789,53 @@ CONF
 # ---- Bootloader Functions ----
 function setup_efi_boot {
     echo "======= Setting up EFI boot =========="
-    
-    # Mount EFI System Partition
-    mkdir -p "$MAIN_BOOT"
-    mount "$BOOT_PART" "$MAIN_BOOT"
-    
-    # Create EFI directory structure    
-    mkdir -p "$MAIN_BOOT/EFI/Boot"
-    
-    # Download ZFSBootMenu EFI binary
+
+    local tmp_efi
+    tmp_efi="$(mktemp)"
     echo "Downloading ZFSBootMenu EFI binary from: $ZBM_EFI_URL"
-    curl -L "$ZBM_EFI_URL" -o "$MAIN_BOOT/EFI/Boot/bootx64.efi"    
+    curl -L "$ZBM_EFI_URL" -o "$tmp_efi"
+
+    for boot_part in "${BOOT_PARTS[@]}"; do
+        mkdir -p "$MAIN_BOOT"
+        mount "$boot_part" "$MAIN_BOOT"
+        mkdir -p "$MAIN_BOOT/EFI/Boot"
+        cp "$tmp_efi" "$MAIN_BOOT/EFI/Boot/bootx64.efi"
+        sync
+        umount "$MAIN_BOOT" || true
+    done
+
+    rm -f "$tmp_efi"
 }
 
 function setup_bios_boot {
     echo "======= Setting up BIOS boot =========="
-    
-    # Mount boot partition
-    mkdir -p "$MAIN_BOOT"
-    mount "$BOOT_PART" "$MAIN_BOOT"
-    
+
     # Install extlinux in rescue system if needed
     if ! command -v extlinux &> /dev/null; then
         echo "Installing extlinux in rescue system..."
         apt update
         apt install -y extlinux
     fi
-    
-    # Install extlinux
-    extlinux --install "$MAIN_BOOT"
-    
-    # Create extlinux configuration
-    cat > "$MAIN_BOOT/extlinux.conf" << 'EOF'
+
+    # Download and unpack ZFSBootMenu for BIOS once.
+    local TEMP_ZBM
+    TEMP_ZBM="$(mktemp -d)"
+    echo "Downloading ZFSBootMenu for BIOS from: $ZBM_BIOS_URL"
+    curl -L "$ZBM_BIOS_URL" -o "$TEMP_ZBM/zbm.tar.gz"
+    tar -xz -C "$TEMP_ZBM" -f "$TEMP_ZBM/zbm.tar.gz" --strip-components=1
+
+    for idx in "${!BOOT_PARTS[@]}"; do
+        local boot_part="${BOOT_PARTS[$idx]}"
+        local disk="${INSTALL_DISKS[$idx]}"
+
+        echo "Installing BIOS boot to: $disk ($boot_part)"
+
+        mkdir -p "$MAIN_BOOT"
+        mount "$boot_part" "$MAIN_BOOT"
+
+        extlinux --install "$MAIN_BOOT"
+
+        cat > "$MAIN_BOOT/extlinux.conf" << 'EOF'
 DEFAULT zfsbootmenu
 PROMPT 0
 TIMEOUT 0
@@ -676,31 +846,23 @@ LABEL zfsbootmenu
     APPEND ro quiet
 EOF
 
-    echo "Generated extlinux.conf:"
-    cat "$MAIN_BOOT/extlinux.conf"
-    
-    # Download and install ZFSBootMenu for BIOS
-    local TEMP_ZBM=$(mktemp -d)
-    echo "Downloading ZFSBootMenu for BIOS from: $ZBM_BIOS_URL"
-    curl -L "$ZBM_BIOS_URL" -o "$TEMP_ZBM/zbm.tar.gz"
-    tar -xz -C "$TEMP_ZBM" -f "$TEMP_ZBM/zbm.tar.gz" --strip-components=1
-    
-    # Copy ZFSBootMenu to boot partition
-    mkdir -p "$MAIN_BOOT/zfsbootmenu"
-    cp "$TEMP_ZBM"/vmlinuz* "$MAIN_BOOT/zfsbootmenu/"
-    cp "$TEMP_ZBM"/initramfs* "$MAIN_BOOT/zfsbootmenu/"
-    
-    # Clean up
+        mkdir -p "$MAIN_BOOT/zfsbootmenu"
+        cp "$TEMP_ZBM"/vmlinuz* "$MAIN_BOOT/zfsbootmenu/"
+        cp "$TEMP_ZBM"/initramfs* "$MAIN_BOOT/zfsbootmenu/"
+        sync
+
+        echo "ZFSBootMenu files on $boot_part:"
+        ls -la "$MAIN_BOOT/zfsbootmenu/" || true
+
+        umount "$MAIN_BOOT" || true
+
+        dd bs=440 conv=notrunc count=1 if="/usr/lib/EXTLINUX/gptmbr.bin" of="$disk"
+        parted "$disk" set 1 boot on
+    done
+
     rm -rf "$TEMP_ZBM"
-    
-    echo "ZFSBootMenu files copied to boot partition:"
-    ls -la "$MAIN_BOOT/zfsbootmenu/"
-    
-    # Install MBR and set boot flag
-    dd bs=440 conv=notrunc count=1 if="/usr/lib/EXTLINUX/gptmbr.bin" of="$INSTALL_DISK"
-    parted "$INSTALL_DISK" set 1 boot on
-    
-    echo "BIOS boot setup complete"
+
+    echo "BIOS boot setup complete (all selected disks)"
 }
 
 function configure_bootloader {
@@ -748,18 +910,50 @@ EOF
 }
 
 function configure_networking {
-    echo "======= Configuring systemd-networkd for Hetzner Cloud =========="
+    echo "======= Configuring networking =========="
     
-    # Create systemd-networkd configuration for all ethernet interfaces
+    # Create systemd-networkd configuration. Dedicated servers are typically static; we match by MAC.
     mkdir -p "$TARGET/etc/systemd/network"
     
-    cat > "$TARGET/etc/systemd/network/10-hetzner.network" <<'EOF'
+    if [[ "$NETWORK_MODE" == "static" && -n "$NET_MAC" && -n "$NET_IPV4_CIDR" && -n "$NET_GW4" ]]; then
+        local dns_line=""
+        if [[ ${#NET_DNS_SERVERS[@]} -gt 0 ]]; then
+            dns_line="DNS=$(printf '%s ' "${NET_DNS_SERVERS[@]}" | sed 's/[[:space:]]*$//')"
+        fi
+
+        {
+            echo "[Match]"
+            echo "MACAddress=$NET_MAC"
+            echo ""
+            echo "[Network]"
+            echo "Address=$NET_IPV4_CIDR"
+            echo "$dns_line"
+            echo "IPv6AcceptRA=yes"
+            if [[ -n "$NET_IPV6_CIDR" ]]; then
+                echo "Address=$NET_IPV6_CIDR"
+            fi
+            echo ""
+            echo "[Route]"
+            echo "Destination=0.0.0.0/0"
+            echo "Gateway=$NET_GW4"
+            echo "GatewayOnLink=yes"
+            if [[ -n "$NET_GW6" ]]; then
+                echo ""
+                echo "[Route]"
+                echo "Destination=::/0"
+                echo "Gateway=$NET_GW6"
+                echo "GatewayOnLink=yes"
+            fi
+        } > "$TARGET/etc/systemd/network/10-hetzner.network"
+    else
+        cat > "$TARGET/etc/systemd/network/10-hetzner.network" <<'EOF'
 [Match]
 Name=ens* enp* eth*
 
 [Network]
 DHCP=yes
 IPv6PrivacyExtensions=yes
+IPv6AcceptRA=yes
 
 [DHCP]
 RouteMetric=100
@@ -774,7 +968,8 @@ UseDomains=yes
 [IPv6AcceptRA]
 RouteMetric=100
 EOF
-
+    fi
+    
     echo "systemd-networkd configuration:"
     cat "$TARGET/etc/systemd/network/10-hetzner.network"
     echo ""
@@ -902,7 +1097,7 @@ function main {
     
     # System detection
     detect_efi
-    find_install_disk
+    select_install_disks
     
     # Show summary and get confirmation
     show_summary_and_confirm
